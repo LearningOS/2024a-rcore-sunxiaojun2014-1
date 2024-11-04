@@ -15,8 +15,10 @@ mod switch;
 mod task;
 
 use crate::config::MAX_APP_NUM;
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -45,6 +47,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// current time
+    current_time: usize,
 }
 
 lazy_static! {
@@ -54,6 +58,9 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            user_time: 0,
+            kernel_time: 0,
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -65,6 +72,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    current_time: get_time_ms(),
                 })
             },
         }
@@ -95,6 +103,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Ready;
+        inner.tasks[current].kernel_time = self.get_kernel_time();
     }
 
     /// Change the status of current `Running` task into `Exited`.
@@ -102,6 +111,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Exited;
+        inner.tasks[current].kernel_time = self.get_kernel_time();
     }
 
     /// Find next task to run and return task id.
@@ -121,10 +131,11 @@ impl TaskManager {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
-            inner.tasks[next].task_status = TaskStatus::Running;
+            let mut next_task = inner.tasks[next];
+            next_task.task_status = TaskStatus::Running;
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
-            let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
@@ -135,6 +146,54 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    fn get_time(&self) -> usize {
+        let mut inner = self.inner.exclusive_access();
+        let start_time = inner.current_time;
+        inner.current_time = get_time_ms();
+        inner.current_time - start_time
+    }
+
+    fn enter_user_time(&self) {
+        let task = self.get_current_task();
+        task.kernel_time += self.get_time();
+    }
+
+    fn enter_kernel_time(&self) {
+        let task = self.get_current_task();
+        task.user_time += self.get_time();
+    }
+
+    // 获取当前正在运行的任务ID
+    fn get_current_task_id(&self) -> usize {
+        self.inner.exclusive_access().current_task
+    }
+
+    // 获取当前正在运行的任务
+    fn get_current_task(&self) -> &mut TaskControlBlock {
+        &mut self.inner.exclusive_access().tasks[self.get_current_task_id()]
+    }
+}
+
+pub fn add_syscall_time(syscall_id: usize) {
+    if syscall_id >= MAX_SYSCALL_NUM {
+        return;
+    }
+    TASK_MANAGER.get_current_task().syscall_times[syscall_id] += 1;
+}
+
+pub fn get_current_task() -> &mut TaskControlBlock {
+    TASK_MANAGER.get_current_task()
+}
+
+/// enter user time
+pub fn enter_user_time() {
+    TASK_MANAGER.enter_user_time();
+}
+
+/// enter kernel time
+pub fn enter_kernel_time() {
+    TASK_MANAGER.enter_kernel_time();
 }
 
 /// Run the first task in task list.
